@@ -9,6 +9,15 @@ def rmsle_torch(y_true, y_pred, eps=1e-7):
     log_pred = torch.log1p(y_pred + eps)
     return torch.sqrt(torch.mean((log_true - log_pred) ** 2))
 
+def expectile_loss_torch(y_true, y_pred, alpha=0.5):
+    diff = y_pred - y_true
+    w = torch.where(diff > 0, 2.0 * (1.0 - alpha), 2.0 * alpha)
+    return torch.mean(0.5 * w * diff * diff)
+
+def pseudo_huber_loss_torch(y_true, y_pred, delta=1.0):
+    diff = y_pred - y_true
+    return torch.mean((delta * delta) * (torch.sqrt(1.0 + (diff / delta) ** 2) - 1.0))
+
 def softmax(logits, dim=-1):
     """Numerically stable softmax"""
     exp_logits = torch.exp(logits - torch.max(logits, dim=dim, keepdim=True)[0])
@@ -27,7 +36,7 @@ def log_loss_torch(y_true_labels, y_pred_probs, eps=1e-15):
     n_samples = y_true_labels.shape[0]
     
     # Get the predicted probability for the true class
-    true_class_probs = y_pred_probs[torch.arange(n_samples), y_true_labels.long()]
+    true_class_probs = y_pred_probs[torch.arange(n_samples, device=y_true_labels.device), y_true_labels.long()]
     
     # Return negative log likelihood
     return -torch.mean(torch.log(true_class_probs))
