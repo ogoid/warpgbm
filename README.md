@@ -301,6 +301,14 @@ model.fit(X, y)  # Blazing fast!
 
 **Result: 13× faster than LightGBM on Numerai data (49s vs 643s)**
 
+Pre-binned matrices are transferred to the GPU in one contiguous copy. Flattened
+inference trees are cached across prediction calls and invalidated by fitting,
+warm-start updates, and `load_model()`. Use those methods to change the forest;
+manual edits to `forest` do not invalidate the cache. Feature importance is
+accumulated on the GPU and remains available as NumPy arrays after fitting.
+New trees store feature indices as ordinary integers, avoiding tensor storage in
+native model exports; existing `save_model()` files remain loadable.
+
 ---
 
 ## 🧠 Invariant Learning: Why It Matters
@@ -417,28 +425,58 @@ model.per_era_feature_importance_ # Per-era feature importance (when era_id used
 
 ## 🔧 Installation Details
 
-### Linux / macOS (Recommended)
+WarpGBM needs CUDA-enabled PyTorch and a compatible CUDA toolkit to build its
+extension. CPU-only wheels are not supported: builds fail clearly instead of
+silently omitting the extension. Source distributions and metadata can still be
+generated without CUDA. A GPU is not needed for compilation when the intended
+architecture is supplied explicitly.
+
+### Linux / preconfigured CUDA environments
+
+Install the intended CUDA-enabled PyTorch first, then build against that environment:
 
 ```bash
-pip install git+https://github.com/jefferythewind/warpgbm.git
+python -m pip install setuptools wheel ninja
+python -m pip wheel . --no-build-isolation --no-deps -w dist
 ```
 
-Compiles CUDA extensions using your local PyTorch + CUDA setup.
-
-### Colab / Mismatched CUDA Versions
-
-```bash
-pip install warpgbm --no-build-isolation
-```
+Set `CUDA_HOME` to the toolkit and `TORCH_CUDA_ARCH_LIST` to the intended GPU
+architecture (for example, `12.0` for an RTX 5060), especially for headless builds.
+Ninja provides incremental parallel compilation; `MAX_JOBS` controls compiler
+workers, not model training. CUDA files use ATen headers without Python/pybind
+bindings, which remain in `node_kernel.cpp`. Do not enable fast-math to speed up
+compilation: it changes numerical behavior.
 
 ### Windows
 
-```bash
-git clone https://github.com/jefferythewind/warpgbm.git
-cd warpgbm
-python setup.py bdist_wheel
-pip install dist/warpgbm-*.whl
+Initialize MSVC before the same wheel command. For example, with this CUDA/toolchain:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set "CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+set "TORCH_CUDA_ARCH_LIST=12.0"
+set "DISTUTILS_USE_SDK=1"
+python -m pip wheel . --no-build-isolation --no-deps -w dist
 ```
+
+The build supplies `/Zc:preprocessor` to MSVC automatically. Install and reuse the
+resulting wheel only with compatible OS, Python ABI, PyTorch/CUDA versions and GPU
+architecture. Preserve those identities and the wheel hash with experiment records.
+
+### CUDA execution contracts
+
+The native entry points require matching CUDA devices, specified dtypes, contiguous
+tensors and matching shapes. Kernels use PyTorch's current stream on the input
+device. Invalid launch dimensions, parameters and shared-memory requirements raise
+Python exceptions instead of printing errors and continuing. Histograms opt in to
+larger dynamic shared memory when supported; requests beyond the hardware limit
+fail without changing the number of eras or bins.
+
+Calls stay asynchronous: device execution errors surface at the next CUDA
+synchronization, as with PyTorch. Cross-stream dependencies and tensor lifetimes
+remain the caller's responsibility. Native index arrays and tree contents must be
+valid; the wrappers check metadata, not every GPU value. Never load untrusted
+pickle files.
 
 ---
 
