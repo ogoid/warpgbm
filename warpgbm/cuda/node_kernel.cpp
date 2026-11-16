@@ -71,6 +71,30 @@ void launch_find_best_split_fused(
     at::Tensor &out_mean_gain,
     int threads = 128);
 
+void launch_find_best_split_era_select(
+    const at::Tensor &G,
+    const at::Tensor &H,
+    const at::Tensor &total_G,
+    const at::Tensor &total_H,
+    const at::Tensor &era_weights,
+    const at::Tensor &level_mask,
+    float min_split_gain,
+    float min_child_weight,
+    float L1_reg,
+    float L2_reg,
+    bool has_missing,
+    int era_mode,
+    float agreement_threshold,
+    float agreement_power,
+    at::Tensor &cand_gain,
+    at::Tensor &cand_dir,
+    at::Tensor &out_score,
+    at::Tensor &out_agreement,
+    at::Tensor &out_mean_gain,
+    at::Tensor &out_best,
+    at::Tensor &out_era_gains,
+    int threads = 128);
+
 void launch_bin_2d_kernel(
     const at::Tensor &X,
     const at::Tensor &bin_edges,
@@ -100,7 +124,19 @@ void launch_histogram_fm_v2(
     bool pack4,
     bool has_missing,
     int threads_per_block = 128,
-    int rows_per_thread = 16);
+    int rows_per_thread = 16,
+    bool contiguous_samples = false,
+    bool era_sorted = false);
+
+int64_t launch_partition_samples_fm(
+    const at::Tensor &bin_data,
+    const at::Tensor &in_samples,
+    at::Tensor &out_samples,
+    at::Tensor &block_counts,
+    int64_t feat_idx,
+    int32_t split_bin,
+    bool default_left,
+    bool pack4);
 
 void launch_extract_split_mask(
     const at::Tensor &bin_data,
@@ -156,12 +192,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
     m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
     m.def("compute_histogram_fm", &launch_histogram_fm_kernel, "Weighted Feature-Major Histogram (CUDA)");
-    m.def("compute_histogram_fm_v2", &launch_histogram_fm_v2, "Fast Privatized Feature-Major Histogram (CUDA)");
+    m.def("compute_histogram_fm_v2", &launch_histogram_fm_v2, "Fast Privatized Feature-Major Histogram (CUDA)",
+          py::arg("bin_data"), py::arg("grads"), py::arg("gh_packed"),
+          py::arg("sample_indices"), py::arg("feature_indices"), py::arg("era_indices"),
+          py::arg("grad_hist"), py::arg("hess_hist"),
+          py::arg("miss_grad"), py::arg("miss_hess"),
+          py::arg("num_bins"), py::arg("pack4"), py::arg("has_missing"),
+          py::arg("threads_per_block") = 128, py::arg("rows_per_thread") = 16,
+          py::arg("contiguous_samples") = false, py::arg("era_sorted") = false);
+    m.def("partition_samples_fm", &launch_partition_samples_fm, "Stable GPU Binary Sample Partition (CUDA)");
     m.def("extract_split_mask", &launch_extract_split_mask, "Extract Split Mask (CUDA)");
     m.def("find_best_split_pooled", &launch_find_best_split_pooled, "Fused Pooled Split+Argmax (CUDA)");
     m.def("pack_int8_to_4bit_fm", &launch_pack_int8_to_4bit_fm, "Pack Int8 to 4-bit FM (CUDA)");
     m.def("bin_2d_pack4_fm", &launch_bin_2d_pack4_fm, "Bin Float32 to 4-bit FM (CUDA)");
     m.def("find_best_split_fused", &launch_find_best_split_fused, "Fused Era Split Finder (CUDA)");
+    m.def("find_best_split_era_select", &launch_find_best_split_era_select, "Fused Era Split + Argmax Finder (CUDA)");
     m.def("bin_2d", &launch_bin_2d_kernel, "2D Batch CUDA Binning Kernel");
     m.def("predict_forest_fm", &predict_with_forest_fm, "Feature-Major CUDA Predictions");
     m.def("predict_forest_fm_packed", &predict_with_forest_fm_packed, "4-bit Packed Feature-Major CUDA Predictions");

@@ -96,6 +96,42 @@ __device__ __forceinline__ int8_t find_bin_val(
     return static_cast<int8_t>(lo);
 }
 
+__device__ __forceinline__ int8_t find_bin_val_sh(
+    float val,
+    const float (*__restrict__ sh_edges)[32],
+    int tx,
+    int B_minus1)
+{
+    if (isnan(val))
+    {
+        return static_cast<int8_t>(-1);
+    }
+    if (B_minus1 <= 8)
+    {
+        int bin = 0;
+        while (bin < B_minus1 && val >= sh_edges[bin][tx])
+        {
+            ++bin;
+        }
+        return static_cast<int8_t>(bin);
+    }
+    int lo = 0;
+    int hi = B_minus1;
+    while (lo < hi)
+    {
+        int mid = (lo + hi) >> 1;
+        if (val >= sh_edges[mid][tx])
+        {
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    return static_cast<int8_t>(lo);
+}
+
 __global__ void bin_2d_fm_kernel(
     const float *__restrict__ X,          // [N, F] row-major
     const float *__restrict__ bin_edges,  // [F, B - 1]
@@ -104,22 +140,59 @@ __global__ void bin_2d_fm_kernel(
     int64_t F,
     int B_minus1)
 {
-    __shared__ int8_t tile[16][17];
-    int64_t f = static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.x;
-    int64_t n = static_cast<int64_t>(blockIdx.y) * 16 + threadIdx.y;
+    __shared__ int8_t tile[32][33];
+    __shared__ float sh_edges[32][32];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int64_t f0 = static_cast<int64_t>(blockIdx.x) * 32;
+    const int64_t n0 = static_cast<int64_t>(blockIdx.y) * 32;
+    const bool use_sh = (B_minus1 <= 32);
 
-    if (n < N && f < F)
+    if (use_sh)
     {
-        float val = X[n * F + f];
-        tile[threadIdx.y][threadIdx.x] = find_bin_val(val, bin_edges + f * B_minus1, B_minus1);
+        const int total_e = 32 * B_minus1;
+        for (int idx = ty * 32 + tx; idx < total_e; idx += 256)
+        {
+            const int fl = idx / B_minus1;
+            const int b = idx % B_minus1;
+            const int64_t fg = f0 + fl;
+            sh_edges[b][fl] = (fg < F) ? bin_edges[fg * B_minus1 + b] : 0.0f;
+        }
+        __syncthreads();
+    }
+
+    const int64_t f = f0 + tx;
+    const bool valid_f = (f < F);
+    const float *edges_f = bin_edges + f * B_minus1;
+
+    #pragma unroll
+    for (int r = 0; r < 32; r += 8)
+    {
+        const int row_l = ty + r;
+        const int64_t n = n0 + row_l;
+        if (valid_f && n < N)
+        {
+            const float val = X[n * F + f];
+            tile[row_l][tx] = use_sh
+                ? find_bin_val_sh(val, sh_edges, tx, B_minus1)
+                : find_bin_val(val, edges_f, B_minus1);
+        }
     }
     __syncthreads();
 
-    int64_t f_out = static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.y;
-    int64_t n_out = static_cast<int64_t>(blockIdx.y) * 16 + threadIdx.x;
-    if (f_out < F && n_out < N)
+    const int64_t n_out = n0 + tx;
+    if (n_out < N)
     {
-        bin_indices_fm[f_out * N + n_out] = tile[threadIdx.x][threadIdx.y];
+        #pragma unroll
+        for (int r = 0; r < 32; r += 8)
+        {
+            const int fl = ty + r;
+            const int64_t f_out = f0 + fl;
+            if (f_out < F)
+            {
+                bin_indices_fm[f_out * N + n_out] = tile[tx][fl];
+            }
+        }
     }
 }
 
@@ -175,8 +248,8 @@ void launch_bin_2d_kernel(
 
     if (feature_major)
     {
-        dim3 threads(16, 16);
-        dim3 blocks((F + 15) / 16, (N + 15) / 16);
+        dim3 threads(32, 8);
+        dim3 blocks((F + 31) / 32, (N + 31) / 32);
         TORCH_CHECK(blocks.x <= properties->maxGridSize[0] && blocks.y <= properties->maxGridSize[1],
                     "2D binner launch exceeds CUDA grid limits");
         bin_2d_fm_kernel<<<blocks, threads, 0, stream.stream()>>>(
@@ -263,35 +336,64 @@ __global__ void bin_2d_pack4_fm_kernel(
     int64_t p_offset,
     int B_minus1)
 {
-    __shared__ uint8_t tile[16][17];
-    const int64_t f = static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.x;
-    const int64_t p = static_cast<int64_t>(blockIdx.y) * 16 + threadIdx.y;
-    const int64_t n0 = 2 * p;
-    const int64_t n1 = n0 + 1;
+    __shared__ uint8_t tile[32][33];
+    __shared__ float sh_edges[16][32];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int64_t f0 = static_cast<int64_t>(blockIdx.x) * 32;
+    const int64_t p0 = static_cast<int64_t>(blockIdx.y) * 32;
 
-    uint8_t packed = 0;
-    if (f < F && n0 < N_chunk)
+    const int total_e = 32 * B_minus1;
+    for (int idx = ty * 32 + tx; idx < total_e; idx += 256)
     {
-        const float *edges_f = bin_edges + f * B_minus1;
-        const int8_t b0 = find_bin_val(X[n0 * F + f], edges_f, B_minus1);
-        const uint8_t nib0 = static_cast<uint8_t>((b0 + 1) & 0x0F);
-        uint8_t nib1 = 0;
-        if (n1 < N_chunk)
-        {
-            const int8_t b1 = find_bin_val(X[n1 * F + f], edges_f, B_minus1);
-            nib1 = static_cast<uint8_t>((b1 + 1) & 0x0F);
-        }
-        packed = nib0 | static_cast<uint8_t>(nib1 << 4);
+        const int fl = idx / B_minus1;
+        const int b = idx % B_minus1;
+        const int64_t fg = f0 + fl;
+        sh_edges[b][fl] = (fg < F) ? bin_edges[fg * B_minus1 + b] : 0.0f;
     }
-    tile[threadIdx.y][threadIdx.x] = packed;
     __syncthreads();
 
-    const int64_t f_out = static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.y;
-    const int64_t p_out = static_cast<int64_t>(blockIdx.y) * 16 + threadIdx.x;
-    const int64_t N_chunk_packed = (N_chunk + 1) >> 1;
-    if (f_out < F && p_out < N_chunk_packed)
+    const int64_t f = f0 + tx;
+    const bool valid_f = (f < F);
+
+    #pragma unroll
+    for (int rp = 0; rp < 32; rp += 8)
     {
-        out_packed[f_out * N_total_packed + p_offset + p_out] = tile[threadIdx.x][threadIdx.y];
+        const int pl = ty + rp;
+        const int64_t p = p0 + pl;
+        const int64_t n0 = 2 * p;
+        const int64_t n1 = n0 + 1;
+        uint8_t packed = 0;
+        if (valid_f && n0 < N_chunk)
+        {
+            const int8_t b0 = find_bin_val_sh(X[n0 * F + f], sh_edges, tx, B_minus1);
+            const uint8_t nib0 = static_cast<uint8_t>((b0 + 1) & 0x0F);
+            uint8_t nib1 = 0;
+            if (n1 < N_chunk)
+            {
+                const int8_t b1 = find_bin_val_sh(X[n1 * F + f], sh_edges, tx, B_minus1);
+                nib1 = static_cast<uint8_t>((b1 + 1) & 0x0F);
+            }
+            packed = nib0 | static_cast<uint8_t>(nib1 << 4);
+        }
+        tile[pl][tx] = packed;
+    }
+    __syncthreads();
+
+    const int64_t p_out = p0 + tx;
+    const int64_t N_chunk_packed = (N_chunk + 1) >> 1;
+    if (p_out < N_chunk_packed)
+    {
+        #pragma unroll
+        for (int rf = 0; rf < 32; rf += 8)
+        {
+            const int fl = ty + rf;
+            const int64_t f_out = f0 + fl;
+            if (f_out < F)
+            {
+                out_packed[f_out * N_total_packed + p_offset + p_out] = tile[tx][fl];
+            }
+        }
     }
 }
 
@@ -358,8 +460,8 @@ void launch_bin_2d_pack4_fm(
 
     const c10::cuda::CUDAGuard guard(device);
     const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
-    dim3 threads(16, 16);
-    dim3 blocks((F + 15) / 16, (N_chunk_packed + 15) / 16);
+    dim3 threads(32, 8);
+    dim3 blocks((F + 31) / 32, (N_chunk_packed + 31) / 32);
     bin_2d_pack4_fm_kernel<<<blocks, threads, 0, stream.stream()>>>(
         X.data_ptr<float>(), bin_edges.data_ptr<float>(), out_packed.data_ptr<uint8_t>(),
         N_chunk, F, N_total_packed, p_offset, static_cast<int>(B_minus1));

@@ -149,6 +149,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._is_fitted = False
         self._trees_trained = 0
         self._tree_tensors = None
+        self._tree_tensors_int4 = None
         self._torch_rng = None
         self.best_iteration_ = 0
         self.best_eval_loss_ = float("inf")
@@ -510,6 +511,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 return self
 
         self._tree_tensors = None
+        self._tree_tensors_int4 = None
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
 
@@ -617,7 +619,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 (self.num_samples,), self.base_prediction, dtype=torch.float32, device=self.device
             )
 
-        self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
+        self._use_era_sorted = (
+            self._num_hist_eras > 1
+            and (2 * self._num_hist_eras * (self.num_bins + (1 if self.has_missing_ else 0)) * 4) > 12288
+        )
+        if self._use_era_sorted:
+            self.root_node_indices = torch.argsort(self.era_indices, stable=True).to(torch.int32)
+        else:
+            self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
         if X_eval is not None and y_eval is not None:
@@ -679,7 +688,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 if self.class_priors_[k] != 0.0:
                     self.gradients[:, k] = self.class_priors_[k]
 
-        self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
+        self._use_era_sorted = (
+            self._num_hist_eras > 1
+            and (2 * self._num_hist_eras * (self.num_bins + (1 if self.has_missing_ else 0)) * 4) > 12288
+        )
+        if self._use_era_sorted:
+            self.root_node_indices = torch.argsort(self.era_indices, stable=True).to(torch.int32)
+        else:
+            self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
         if X_eval is not None and y_eval is not None:
@@ -715,6 +731,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def _compute_bin_edges_gpu(self, X_np):
         """Compute quantile bin edges in chunks on GPU while ignoring NaNs."""
         num_samples, num_features = X_np.shape
+        if num_samples > 262_144:
+            step = max(1, num_samples // 262_144)
+            X_q = X_np[::step]
+        else:
+            X_q = X_np
         bin_edges = torch.zeros(
             (num_features, self.num_bins - 1), dtype=torch.float32, device=self.device
         )
@@ -727,7 +748,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         for f0 in range(0, num_features, f_chunk):
             f1 = min(f0 + f_chunk, num_features)
             X_blk = torch.from_numpy(
-                np.ascontiguousarray(X_np[:, f0:f1], dtype=np.float32)
+                np.ascontiguousarray(X_q[:, f0:f1], dtype=np.float32)
             ).to(self.device)
             nan_mask = torch.isnan(X_blk)
             if not nan_mask.any():
@@ -881,6 +902,47 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     return bin_indices_fm, era_indices, bin_edges, unique_eras, Y_gpu
 
             self._log("quantile binning.")
+            if self.num_samples <= 262_144 and self.num_samples > 0:
+                bin_edges = torch.zeros(
+                    (self.num_features, self.num_bins - 1), dtype=torch.float32, device=self.device
+                )
+                quantiles = torch.linspace(
+                    0, 1, self.num_bins + 1, device=self.device, dtype=torch.float32
+                )[1:-1]
+                has_missing = False
+                f_chunk = min(256, max(16, (32 * 1024 * 1024) // max(1, self.num_samples)))
+                for f0 in range(0, self.num_features, f_chunk):
+                    f1 = min(f0 + f_chunk, self.num_features)
+                    X_blk = torch.from_numpy(
+                        np.ascontiguousarray(X_np[:, f0:f1], dtype=np.float32)
+                    ).to(self.device)
+                    nan_mask = torch.isnan(X_blk)
+                    if not nan_mask.any():
+                        edges_blk = torch.quantile(X_blk, quantiles, dim=0).t().contiguous()
+                    else:
+                        has_missing = True
+                        edges_blk = torch.zeros(
+                            (f1 - f0, self.num_bins - 1), dtype=torch.float32, device=self.device
+                        )
+                        for j in range(f1 - f0):
+                            col = X_blk[:, j]
+                            col_nan = nan_mask[:, j]
+                            if not col_nan.any():
+                                edges_blk[j] = torch.quantile(col, quantiles)
+                            else:
+                                valid = col[~col_nan]
+                                if valid.numel() > 0:
+                                    edges_blk[j] = torch.quantile(valid, quantiles)
+                    bin_edges[f0:f1] = edges_blk
+                    out_view = bin_indices_fm[f0:f1]
+                    if pack4:
+                        node_kernel.bin_2d_pack4_fm(X_blk, edges_blk, out_view, 0)
+                    else:
+                        node_kernel.bin_2d(X_blk, edges_blk, out_view, True)
+                    del X_blk, nan_mask, edges_blk
+                self.has_missing_ = has_missing
+                return bin_indices_fm, era_indices, bin_edges, unique_eras, Y_gpu
+
             bin_edges, has_missing = self._compute_bin_edges_gpu(X_np)
             self.has_missing_ = has_missing
             edges_contig = bin_edges.contiguous()
@@ -999,6 +1061,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         hess_hist=None,
         miss_grad=None,
         miss_hess=None,
+        contiguous_samples=False,
     ):
         """Fast feature-major weighted histogram builder using pre-allocated buffers."""
         E = self._num_hist_eras
@@ -1053,6 +1116,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             bool(self.has_missing_),
             eff_tb,
             eff_rpt,
+            bool(contiguous_samples),
+            bool(getattr(self, "_use_era_sorted", False)),
         )
 
         if E == 1:
@@ -1094,8 +1159,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         B = self.num_bins
         M = (B - 1) * (2 if self.has_missing_ else 1)
         self._out_best_pooled = torch.empty(10, device=self.device, dtype=torch.float32)
+        self._out_best_era = torch.empty(5, device=self.device, dtype=torch.float32)
+        self._out_best_era_gains = torch.empty(E, device=self.device, dtype=torch.float32) if E > 1 else None
         n_sub = max(1, int(self.subsample * self.num_samples)) if self.subsample < 1.0 else self.num_samples
-        self._mask_scratch = torch.empty(n_sub, device=self.device, dtype=torch.bool)
+        self._part_bufs = [
+            torch.empty(n_sub, device=self.device, dtype=torch.int32),
+            torch.empty(n_sub, device=self.device, dtype=torch.int32),
+        ]
+        self._part_ws = torch.empty((n_sub + 1023) // 1024 + 2, device=self.device, dtype=torch.int32)
+        if self.objective in ("multiclass", "binary"):
+            self._mc_res_buf = torch.empty(self.num_samples, device=self.device, dtype=torch.float32)
+            self._mc_hess_buf = torch.empty(self.num_samples, device=self.device, dtype=torch.float32)
+        else:
+            self._mc_res_buf = None
+            self._mc_hess_buf = None
         self._last_miss_g = self._empty_float
         self._last_miss_h = self._empty_float
 
@@ -1241,12 +1318,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return local_feat, best_bin, default_left, best_cand, best_score
 
         era_mode = _ERA_MODE_MAP[self.era_split_mode]
-        node_kernel.find_best_split_fused(
+        mask_t = self._empty_bool if level_mask is None else level_mask
+        node_kernel.find_best_split_era_select(
             grad_hist,
             hess_hist,
             total_G if self.has_missing_ else self._empty_float,
             total_H if self.has_missing_ else self._empty_float,
             self._empty_float,
+            mask_t,
             float(self.min_split_gain),
             self._effective_min_child_weight(),
             float(self.L1_reg),
@@ -1260,40 +1339,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._out_score,
             self._out_agr,
             self._out_mean_gain,
+            self._out_best_era,
+            self._out_best_era_gains,
             max(128, self.threads_per_block),
         )
 
-        scores = self._out_score
-        if level_mask is not None:
-            scores = scores.clone()
-            scores[~level_mask, :] = float("-inf")
-
-        if era_mode == 0:
-            # Backward-compatible DES max-agreement selection
-            agr = self._out_agr
-            if level_mask is not None:
-                agr = agr.clone()
-                agr[~level_mask, :] = -1.0
-            max_agr = agr.max()
-            valid = (agr == max_agr) & (scores > float("-inf"))
-            if not valid.any():
-                return -1, -1, True, -1, float("-inf")
-            masked_scores = torch.where(valid, scores, float("-inf"))
-            best_idx = torch.argmax(masked_scores)
-            best_score = masked_scores.view(-1)[best_idx].item()
-        else:
-            best_idx = torch.argmax(scores)
-            best_score = scores.view(-1)[best_idx].item()
-            if best_score == float("-inf"):
-                return -1, -1, True, -1, float("-inf")
-
-        M = scores.size(1)
-        split_bins = self.num_bins - 1
-        idx_int = best_idx.item()
-        local_feat = idx_int // M
-        best_cand = idx_int % M
-        default_left = best_cand < split_bins
-        best_bin = best_cand if default_left else (best_cand - split_bins)
+        b = self._out_best_era.tolist()
+        local_feat = int(b[0])
+        if local_feat < 0:
+            return -1, -1, True, -1, float("-inf")
+        best_bin = int(b[1])
+        default_left = b[2] > 0.5
+        best_cand = int(b[3])
+        best_score = b[4]
         return local_feat, best_bin, default_left, best_cand, best_score
 
     def _compute_leaf_value_scalar(self, G_sum, H_sum, parent_val=0.0):
@@ -1325,19 +1383,42 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _partition_indices(self, node_indices, global_feature_idx, best_bin, default_left):
         n_node = node_indices.numel()
-        split_mask = self._mask_scratch[:n_node]
-        node_kernel.extract_split_mask(
+        if n_node == 0:
+            return node_indices, node_indices
+        out_buf = torch.empty_like(node_indices)
+        ws = getattr(self, "_part_ws", None)
+        need_ws = (n_node + 1023) // 1024 + 2
+        if ws is None or ws.numel() < need_ws:
+            ws = torch.empty(need_ws, dtype=torch.int32, device=self.device)
+        n_left = node_kernel.partition_samples_fm(
             self.bin_indices_fm,
             node_indices,
+            out_buf,
+            ws,
             int(global_feature_idx),
             int(best_bin),
             bool(default_left),
             bool(getattr(self, "_packed_fm", False)),
-            split_mask,
         )
-        left_indices = node_indices[split_mask]
-        right_indices = node_indices[~split_mask]
-        return left_indices, right_indices
+        return out_buf[:n_left], out_buf[n_left:]
+
+    def _partition_slice(self, node_slice, global_feature_idx, best_bin, default_left):
+        buf_id, start, end = node_slice
+        out_buf_id = 1 - buf_id
+        in_view = self._part_bufs[buf_id][start:end]
+        out_view = self._part_bufs[out_buf_id][start:end]
+        n_left = node_kernel.partition_samples_fm(
+            self.bin_indices_fm,
+            in_view,
+            out_view,
+            self._part_ws,
+            int(global_feature_idx),
+            int(best_bin),
+            bool(default_left),
+            bool(getattr(self, "_packed_fm", False)),
+        )
+        mid = start + n_left
+        return (out_buf_id, start, mid), (out_buf_id, mid, end)
 
     def _sample_feat_mask(self, k_tree, level_mask=None):
         mask = level_mask
@@ -1363,11 +1444,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return self._sample_feat_mask(k_tree, level_mask=level_mask)
 
     def grow_tree(
-        self, grad_hist, hess_hist, total_G, total_H, node_indices, depth,
+        self, grad_hist, hess_hist, total_G, total_H, node_slice, depth,
         class_k=None, miss_g=None, miss_h=None, parent_val=0.0,
     ):
+        buf_id, start, end = node_slice
         if depth == self.max_depth:
-            return self._assign_leaf(node_indices, total_G, total_H, class_k, parent_val=parent_val)
+            return self._assign_leaf(
+                self._part_bufs[buf_id][start:end], total_G, total_H, class_k, parent_val=parent_val
+            )
 
         level_mask = self._sample_level_mask(self.feat_indices_tree.numel())
         local_feature, best_bin, default_left, best_cand, best_score = self._find_best_split_fm(
@@ -1380,7 +1464,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if pooled and total_G is None:
                 total_G = self._last_pooled_best[8]
                 total_H = self._last_pooled_best[9]
-            return self._assign_leaf(node_indices, total_G, total_H, class_k, parent_val=parent_val)
+            return self._assign_leaf(
+                self._part_bufs[buf_id][start:end], total_G, total_H, class_k, parent_val=parent_val
+            )
 
         if pooled:
             b = self._last_pooled_best
@@ -1396,15 +1482,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._pooled_feat_imp[global_feature_idx] += best_score
         else:
             global_feature_idx = self.feat_indices_tree[local_feature].item()
-            per_era_gains = self._cand_gain[:, local_feature, best_cand]
-            self._per_era_feature_importance_gpu[:, global_feature_idx] += per_era_gains
+            self._per_era_feature_importance_gpu[:, global_feature_idx] += self._out_best_era_gains
             cur_val = self._compute_leaf_value(total_G, total_H, parent_val=parent_val) if self.path_smooth > 0.0 else 0.0
 
-        left_indices, right_indices = self._partition_indices(
-            node_indices, global_feature_idx, best_bin, default_left
+        left_slice, right_slice = self._partition_slice(
+            node_slice, global_feature_idx, best_bin, default_left
         )
-        left_size = left_indices.numel()
-        right_size = right_indices.numel()
+        left_size = left_slice[2] - left_slice[1]
+        right_size = right_slice[2] - right_slice[1]
+        left_indices = self._part_bufs[left_slice[0]][left_slice[1]:left_slice[2]]
+        right_indices = self._part_bufs[right_slice[0]][right_slice[1]:right_slice[2]]
 
         new_depth = depth + 1
         buf_g = self._hist_pool_g[new_depth]
@@ -1433,11 +1520,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             right_child = self.grow_tree(
                 grad_hist_right, hess_hist_right, tot_G_right, tot_H_right,
-                right_indices, new_depth, class_k, miss_g=mg_right, miss_h=mh_right, parent_val=cur_val,
+                right_slice, new_depth, class_k, miss_g=mg_right, miss_h=mh_right, parent_val=cur_val,
             )
             left_child = self.grow_tree(
                 grad_hist_left, hess_hist_left, tot_G_left, tot_H_left,
-                left_indices, new_depth, class_k, miss_g=buf_mg, miss_h=buf_mh, parent_val=cur_val,
+                left_slice, new_depth, class_k, miss_g=buf_mg, miss_h=buf_mh, parent_val=cur_val,
             )
         else:
             grad_hist_right, hess_hist_right, tot_G_right, tot_H_right = self._compute_histograms_fm(
@@ -1460,11 +1547,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             left_child = self.grow_tree(
                 grad_hist_left, hess_hist_left, tot_G_left, tot_H_left,
-                left_indices, new_depth, class_k, miss_g=mg_left, miss_h=mh_left, parent_val=cur_val,
+                left_slice, new_depth, class_k, miss_g=mg_left, miss_h=mh_left, parent_val=cur_val,
             )
             right_child = self.grow_tree(
                 grad_hist_right, hess_hist_right, tot_G_right, tot_H_right,
-                right_indices, new_depth, class_k, miss_g=buf_mg, miss_h=buf_mh, parent_val=cur_val,
+                right_slice, new_depth, class_k, miss_g=buf_mg, miss_h=buf_mh, parent_val=cur_val,
             )
 
         node = {
@@ -1478,7 +1565,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return node
 
     def grow_tree_leafwise(
-        self, grad_hist, hess_hist, total_G, total_H, node_indices,
+        self, grad_hist, hess_hist, total_G, total_H, node_slice,
         class_k=None, miss_g=None, miss_h=None,
     ):
         """Best-first leaf-wise tree growth up to max_leaves using pre-allocated histogram pool."""
@@ -1488,9 +1575,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         pooled = self._num_hist_eras == 1
         free_slots = list(range(1, len(self._lw_pool_g)))
 
-        def evaluate_and_push(node_ref, n_idx, slot, t_g, t_h, depth, parent_val=0.0):
+        def evaluate_and_push(node_ref, n_slice, slot, t_g, t_h, depth, parent_val=0.0):
             nonlocal uid
             if depth >= self.max_depth:
+                n_idx = self._part_bufs[n_slice[0]][n_slice[1]:n_slice[2]]
                 node_ref.update(self._assign_leaf(n_idx, t_g, t_h, class_k, parent_val=parent_val))
                 free_slots.append(slot)
                 return 0
@@ -1507,6 +1595,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 if pooled and t_g is None:
                     t_g = self._last_pooled_best[8]
                     t_h = self._last_pooled_best[9]
+                n_idx = self._part_bufs[n_slice[0]][n_slice[1]:n_slice[2]]
                 node_ref.update(self._assign_leaf(n_idx, t_g, t_h, class_k, parent_val=parent_val))
                 free_slots.append(slot)
                 return 0
@@ -1514,21 +1603,21 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 b = self._last_pooled_best
                 extra = (b[4], b[5], b[6], b[7], t_g if t_g is not None else b[8], t_h if t_h is not None else b[9], best_score, parent_val)
             else:
-                per_era_gains = self._cand_gain[:, lf, bc].clone()
+                per_era_gains = self._out_best_era_gains.clone()
                 extra = (per_era_gains, parent_val)
             uid += 1
             heapq.heappush(
                 heap,
-                (-best_score, uid, node_ref, n_idx, slot, t_g, t_h, lf, bb, dl, extra, depth),
+                (-best_score, uid, node_ref, n_slice, slot, t_g, t_h, lf, bb, dl, extra, depth),
             )
             return 1
 
         active_leaves = 1
-        evaluate_and_push(root_ref, node_indices, 0, total_G, total_H, 0, 0.0)
+        evaluate_and_push(root_ref, node_slice, 0, total_G, total_H, 0, 0.0)
 
         while heap and active_leaves < self.max_leaves:
             (
-                _, _, node_ref, n_idx, s_p, t_g, t_h,
+                _, _, node_ref, n_slice, s_p, t_g, t_h,
                 lf, bb, dl, extra, depth
             ) = heapq.heappop(heap)
 
@@ -1543,7 +1632,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 self._per_era_feature_importance_gpu[:, global_feature_idx] += per_era_gains
                 cur_val = self._compute_leaf_value(t_g, t_h, parent_val=parent_val) if self.path_smooth > 0.0 else 0.0
 
-            left_idx, right_idx = self._partition_indices(n_idx, global_feature_idx, bb, dl)
+            left_slice, right_slice = self._partition_slice(n_slice, global_feature_idx, bb, dl)
+            left_size = left_slice[2] - left_slice[1]
+            right_size = right_slice[2] - right_slice[1]
+            left_idx = self._part_bufs[left_slice[0]][left_slice[1]:left_slice[2]]
+            right_idx = self._part_bufs[right_slice[0]][right_slice[1]:right_slice[2]]
+
             left_ref, right_ref = {}, {}
             node_ref["feature"] = int(global_feature_idx)
             node_ref["bin"] = int(bb)
@@ -1564,7 +1658,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             mg_s = self._lw_miss_g[s_small]
             mh_s = self._lw_miss_h[s_small]
 
-            if left_idx.numel() <= right_idx.numel():
+            if left_size <= right_size:
                 _, _, tg_l, th_l = self._compute_histograms_fm(
                     left_idx, self.feat_indices_tree, g_s, h_s, mg_s, mh_s
                 )
@@ -1595,8 +1689,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             new_depth = depth + 1
             if active_leaves < self.max_leaves:
-                evaluate_and_push(left_ref, left_idx, s_left, tg_l, th_l, new_depth, cur_val)
-                evaluate_and_push(right_ref, right_idx, s_right, tg_r, th_r, new_depth, cur_val)
+                evaluate_and_push(left_ref, left_slice, s_left, tg_l, th_l, new_depth, cur_val)
+                evaluate_and_push(right_ref, right_slice, s_right, tg_r, th_r, new_depth, cur_val)
             else:
                 left_ref.update(self._assign_leaf(left_idx, tg_l, th_l, class_k, parent_val=cur_val))
                 right_ref.update(self._assign_leaf(right_idx, tg_r, th_r, class_k, parent_val=cur_val))
@@ -1604,12 +1698,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 free_slots.append(s_right)
 
         while heap:
-            _, _, node_ref, n_idx, slot, t_g, t_h, *rest = heapq.heappop(heap)
+            _, _, node_ref, n_slice, slot, t_g, t_h, *rest = heapq.heappop(heap)
             extra = rest[3]
             if pooled:
                 t_g, t_h, _, parent_val = extra[4], extra[5], extra[6], extra[7]
             else:
                 parent_val = extra[1]
+            n_idx = self._part_bufs[n_slice[0]][n_slice[1]:n_slice[2]]
             node_ref.update(self._assign_leaf(n_idx, t_g, t_h, class_k, parent_val=parent_val))
             free_slots.append(slot)
 
@@ -1718,13 +1813,22 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             if self.subsample < 1.0:
                 n_sub = max(1, int(self.subsample * self.num_samples))
-                tree_samples = torch.sort(
+                pos = torch.sort(
                     torch.randperm(
                         self.num_samples, generator=self._torch_rng, device=self.device, dtype=torch.int32
                     )[:n_sub]
                 ).values
+                src = self.root_node_indices[pos] if getattr(self, "_use_era_sorted", False) else pos
+                self._part_bufs[0][:n_sub].copy_(src)
+                tree_samples = self._part_bufs[0][:n_sub]
+                is_root_contig = False
             else:
-                tree_samples = self.root_node_indices
+                n_sub = self.num_samples
+                self._part_bufs[0][:n_sub].copy_(self.root_node_indices)
+                tree_samples = self._part_bufs[0][:n_sub]
+                is_root_contig = bool(pooled)
+
+            root_slice = (0, 0, n_sub)
 
             if self.max_leaves is None:
                 g0, h0 = self._hist_pool_g[0], self._hist_pool_h[0]
@@ -1734,22 +1838,23 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 mg0, mh0 = self._lw_miss_g[0], self._lw_miss_h[0]
 
             root_g, root_h, root_tot_g, root_tot_h = self._compute_histograms_fm(
-                tree_samples, self.feat_indices_tree, g0, h0, mg0, mh0
+                tree_samples, self.feat_indices_tree, g0, h0, mg0, mh0, contiguous_samples=is_root_contig
             )
 
             if self.max_leaves is None:
                 tree = self.grow_tree(
-                    root_g, root_h, root_tot_g, root_tot_h, tree_samples, 0,
+                    root_g, root_h, root_tot_g, root_tot_h, root_slice, 0,
                     miss_g=mg0, miss_h=mh0, parent_val=0.0,
                 )
             else:
                 tree = self.grow_tree_leafwise(
-                    root_g, root_h, root_tot_g, root_tot_h, tree_samples,
+                    root_g, root_h, root_tot_g, root_tot_h, root_slice,
                     miss_g=mg0, miss_h=mh0,
                 )
 
             self.forest[i] = tree
             self._tree_tensors = None
+            self._tree_tensors_int4 = None
             self._trees_trained = i + 1
 
             self.compute_eval(i)
@@ -1760,6 +1865,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._trees_trained = self.best_iteration_
         self.forest = self.forest[: self._trees_trained]
         self._tree_tensors = None
+        self._tree_tensors_int4 = None
 
         if pooled:
             self.per_era_feature_importance_[0] = self._pooled_feat_imp
@@ -1770,7 +1876,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         del self._cand_gain, self._cand_dir, self._out_score, self._out_agr, self._out_mean_gain
         del self._hist_pool_g, self._hist_pool_h, self._miss_pool_g, self._miss_pool_h
         del self._lw_pool_g, self._lw_pool_h, self._lw_miss_g, self._lw_miss_h
-        del self._out_best_pooled, self._mask_scratch
+        del self._out_best_pooled, self._out_best_era, self._out_best_era_gains, self._part_bufs, self._part_ws
+        del self._mc_res_buf, self._mc_hess_buf
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
 
@@ -1836,17 +1943,28 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             if self.subsample < 1.0:
                 n_sub = max(1, int(self.subsample * self.num_samples))
-                tree_samples = torch.sort(
+                pos = torch.sort(
                     torch.randperm(
                         self.num_samples, generator=self._torch_rng, device=self.device, dtype=torch.int32
                     )[:n_sub]
                 ).values
+                src = self.root_node_indices[pos] if getattr(self, "_use_era_sorted", False) else pos
+                tree_samples_mc = src
+                is_root_contig = False
             else:
-                tree_samples = self.root_node_indices
+                n_sub = self.num_samples
+                tree_samples_mc = self.root_node_indices
+                is_root_contig = bool(pooled)
+
+            root_slice = (0, 0, n_sub)
 
             for class_k in range(self.num_classes):
-                self.residual = -grads[:, class_k].contiguous()
-                self.hessians = hess[:, class_k].contiguous()
+                torch.neg(grads[:, class_k], out=self._mc_res_buf)
+                self._mc_hess_buf.copy_(hess[:, class_k])
+                self.residual = self._mc_res_buf
+                self.hessians = self._mc_hess_buf
+                self._part_bufs[0][:n_sub].copy_(tree_samples_mc)
+                tree_samples = self._part_bufs[0][:n_sub]
                 if self._gh_packed_buf is not None:
                     torch.stack((self.residual, self.hessians), dim=1, out=self._gh_packed_buf)
                     self.gh_packed = self._gh_packed_buf
@@ -1861,23 +1979,24 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     mg0, mh0 = self._lw_miss_g[0], self._lw_miss_h[0]
 
                 root_g, root_h, root_tot_g, root_tot_h = self._compute_histograms_fm(
-                    tree_samples, self.feat_indices_tree, g0, h0, mg0, mh0
+                    tree_samples, self.feat_indices_tree, g0, h0, mg0, mh0, contiguous_samples=is_root_contig
                 )
 
                 if self.max_leaves is None:
                     tree_k = self.grow_tree(
-                        root_g, root_h, root_tot_g, root_tot_h, tree_samples, 0,
+                        root_g, root_h, root_tot_g, root_tot_h, root_slice, 0,
                         class_k=class_k, miss_g=mg0, miss_h=mh0, parent_val=0.0,
                     )
                 else:
                     tree_k = self.grow_tree_leafwise(
-                        root_g, root_h, root_tot_g, root_tot_h, tree_samples,
+                        root_g, root_h, root_tot_g, root_tot_h, root_slice,
                         class_k=class_k, miss_g=mg0, miss_h=mh0,
                     )
                 trees_k.append(tree_k)
 
             self.forest.append(trees_k)
             self._tree_tensors = None
+            self._tree_tensors_int4 = None
             self._trees_trained = i + 1
 
             self.compute_eval_multiclass(i)
@@ -1888,6 +2007,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._trees_trained = self.best_iteration_
             self.forest = self.forest[: self._trees_trained]
             self._tree_tensors = None
+            self._tree_tensors_int4 = None
 
         if pooled:
             self.per_era_feature_importance_[0] = self._pooled_feat_imp
@@ -1898,7 +2018,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         del self._cand_gain, self._cand_dir, self._out_score, self._out_agr, self._out_mean_gain
         del self._hist_pool_g, self._hist_pool_h, self._miss_pool_g, self._miss_pool_h
         del self._lw_pool_g, self._lw_pool_h, self._lw_miss_g, self._lw_miss_h
-        del self._out_best_pooled, self._mask_scratch
+        del self._out_best_pooled, self._out_best_era, self._out_best_era_gains, self._part_bufs, self._part_ws
+        del self._mc_res_buf, self._mc_hess_buf
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
 
@@ -1945,8 +2066,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"Train LogLoss: {train_loss:.6f} | Eval {self.eval_metric}: {eval_loss:.6f}"
             )
 
+    def _pack_trees_int4(self, t_f32):
+        T, max_nodes, _ = t_f32.shape
+        out = torch.empty((T, max_nodes, 4), dtype=torch.int32, device=t_f32.device)
+        if T == 0:
+            return out
+        is_leaf = t_f32[:, :, 4] > 0.5
+        leaf_bits = t_f32[:, :, 5].contiguous().view(torch.int32)
+        feat_i = t_f32[:, :, 0].to(torch.int32)
+        bin_i = t_f32[:, :, 1].to(torch.int32)
+        dl_i = (t_f32[:, :, 6] > 0.5).to(torch.int32) << 8
+        out[:, :, 0] = torch.where(is_leaf, -1, feat_i)
+        out[:, :, 1] = torch.where(is_leaf, leaf_bits, bin_i | dl_i)
+        out[:, :, 2] = torch.where(is_leaf, 0, t_f32[:, :, 2].to(torch.int32))
+        out[:, :, 3] = torch.where(is_leaf, 0, t_f32[:, :, 3].to(torch.int32))
+        return out
+
     def _get_tree_tensors(self):
         if self._tree_tensors is None:
+            self._tree_tensors_int4 = None
             max_nodes = 2 ** (self.max_depth + 1)
             if self.max_leaves is not None:
                 max_nodes = min(max_nodes, 2 * self.max_leaves)
@@ -1973,6 +2111,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     ]
         return self._tree_tensors
 
+    def _get_tree_tensors_int4(self):
+        t_f32 = self._get_tree_tensors()
+        if self._tree_tensors_int4 is None:
+            if isinstance(t_f32, list):
+                self._tree_tensors_int4 = [self._pack_trees_int4(t) for t in t_f32]
+            else:
+                self._tree_tensors_int4 = self._pack_trees_int4(t_f32)
+        return self._tree_tensors_int4
+
     def predict_binned(self, bin_indices):
         """Predict from row-major [N, F] bin_indices."""
         num_samples = bin_indices.size(0)
@@ -1984,7 +2131,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def _predict_binned_fm(self, bin_indices_fm, num_samples=None, is_packed=False):
         if num_samples is None:
             num_samples = bin_indices_fm.size(1)
-        tree_tensor = self._get_tree_tensors()
+        tree_tensor = self._get_tree_tensors_int4()
         out = torch.full((num_samples,), self.base_prediction, dtype=torch.float32, device=self.device)
         if is_packed:
             node_kernel.predict_forest_fm_packed(
@@ -2005,7 +2152,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if priors[k] != 0.0:
                 F[:, k] = priors[k]
 
-        per_class_tensors = self._get_tree_tensors()
+        per_class_tensors = self._get_tree_tensors_int4()
         bin_c = bin_indices_fm.contiguous()
         for k, tree_tensor in enumerate(per_class_tensors):
             if tree_tensor.size(0) > 0:
@@ -2224,6 +2371,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         self.forest = state["forest"]
         self._tree_tensors = None
+        self._tree_tensors_int4 = None
         self.bin_edges = state["bin_edges"]
         self.base_prediction = state["base_prediction"]
         self.num_features = state["num_features"]

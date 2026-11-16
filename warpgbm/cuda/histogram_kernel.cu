@@ -386,12 +386,12 @@ void launch_histogram_fm_kernel(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <bool SINGLE_ERA, bool HAS_HESS, bool PACK4, bool HAS_MISSING, bool LOCK_FREE>
+template <bool SINGLE_ERA, bool HAS_HESS, bool PACK4, bool HAS_MISSING, int PRIV_MODE>
 __global__ void histogram_fm_v2_kernel(
     const uint8_t *__restrict__ bin_data,      // [F_master, N_total] int8 or [F_master, N_packed] uint8
     const float *__restrict__ grads,           // [N_total] when !HAS_HESS
     const float2 *__restrict__ gh_packed,      // [N_total] when HAS_HESS
-    const int32_t *__restrict__ sample_indices,// [N_node]
+    const int32_t *__restrict__ sample_indices,// [N_node] or nullptr when contiguous [0..N_node)
     const int32_t *__restrict__ feature_indices,// [F]
     const int32_t *__restrict__ era_indices,   // [N_total]
     float *__restrict__ grad_hist,             // [E, F, B]
@@ -413,7 +413,7 @@ __global__ void histogram_fm_v2_kernel(
     const int64_t hist_elems = num_eras * B_store;
 
     extern __shared__ float shmem[];
-    const int64_t sh_stride = LOCK_FREE ? blockDim.x : 1;
+    const int64_t sh_stride = (PRIV_MODE == 2) ? blockDim.x : ((PRIV_MODE == 1) ? 8 : 1);
     const int64_t sh_count = hist_elems * sh_stride;
     float *sh_grad = shmem;
     float *sh_hess = &sh_grad[sh_count];
@@ -430,7 +430,9 @@ __global__ void histogram_fm_v2_kernel(
         const int64_t row = block_base + threadIdx.x + static_cast<int64_t>(r) * blockDim.x;
         if (row < N_node)
         {
-            const int32_t sample = sample_indices[row];
+            const int32_t sample = (sample_indices != nullptr)
+                ? sample_indices[row]
+                : static_cast<int32_t>(row);
             int32_t bin;
             if (PACK4)
             {
@@ -460,11 +462,17 @@ __global__ void histogram_fm_v2_kernel(
                 }
                 const int32_t era = SINGLE_ERA ? 0 : era_indices[sample];
                 const int64_t hist_idx = static_cast<int64_t>(era) * B_store + b_slot;
-                if (LOCK_FREE)
+                if (PRIV_MODE == 2)
                 {
                     const int64_t slot = hist_idx * blockDim.x + threadIdx.x;
                     sh_grad[slot] += g;
                     sh_hess[slot] += h;
+                }
+                else if (PRIV_MODE == 1)
+                {
+                    const int64_t slot = hist_idx * 8 + (threadIdx.x & 7);
+                    atomicAdd(&sh_grad[slot], g);
+                    atomicAdd(&sh_hess[slot], h);
                 }
                 else
                 {
@@ -476,7 +484,7 @@ __global__ void histogram_fm_v2_kernel(
     }
     __syncthreads();
 
-    if (LOCK_FREE)
+    if (PRIV_MODE == 2)
     {
         const int warp_id = threadIdx.x >> 5;
         const int lane = threadIdx.x & 31;
@@ -516,6 +524,37 @@ __global__ void histogram_fm_v2_kernel(
             }
         }
     }
+    else if (PRIV_MODE == 1)
+    {
+        for (int64_t b = threadIdx.x; b < hist_elems; b += blockDim.x)
+        {
+            const int64_t base_b = b * 8;
+            float g_val = 0.0f, h_val = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k)
+            {
+                g_val += sh_grad[base_b + k];
+                h_val += sh_hess[base_b + k];
+            }
+            if (h_val != 0.0f || g_val != 0.0f)
+            {
+                const int64_t e = b / B_store;
+                const int64_t bin_s = b % B_store;
+                if (HAS_MISSING && bin_s == B)
+                {
+                    const int64_t m_idx = e * F + hist_feat_idx;
+                    atomicAdd(&miss_grad[m_idx], g_val);
+                    atomicAdd(&miss_hess[m_idx], h_val);
+                }
+                else
+                {
+                    const int64_t g_idx = e * F * B + static_cast<int64_t>(hist_feat_idx) * B + bin_s;
+                    atomicAdd(&grad_hist[g_idx], g_val);
+                    atomicAdd(&hess_hist[g_idx], h_val);
+                }
+            }
+        }
+    }
     else
     {
         for (int64_t b = threadIdx.x; b < hist_elems; b += blockDim.x)
@@ -525,6 +564,253 @@ __global__ void histogram_fm_v2_kernel(
             if (h_val != 0.0f || g_val != 0.0f)
             {
                 const int64_t e = b / B_store;
+                const int64_t bin_s = b % B_store;
+                if (HAS_MISSING && bin_s == B)
+                {
+                    const int64_t m_idx = e * F + hist_feat_idx;
+                    atomicAdd(&miss_grad[m_idx], g_val);
+                    atomicAdd(&miss_hess[m_idx], h_val);
+                }
+                else
+                {
+                    const int64_t g_idx = e * F * B + static_cast<int64_t>(hist_feat_idx) * B + bin_s;
+                    atomicAdd(&grad_hist[g_idx], g_val);
+                    atomicAdd(&hess_hist[g_idx], h_val);
+                }
+            }
+        }
+    }
+}
+
+template <bool HAS_HESS, bool PACK4, bool HAS_MISSING>
+__global__ void histogram_fm_v2_era_sorted_kernel(
+    const uint8_t *__restrict__ bin_data,
+    const float *__restrict__ grads,
+    const float2 *__restrict__ gh_packed,
+    const int32_t *__restrict__ sample_indices,
+    const int32_t *__restrict__ feature_indices,
+    const int32_t *__restrict__ era_indices,
+    float *__restrict__ grad_hist,
+    float *__restrict__ hess_hist,
+    float *__restrict__ miss_grad,
+    float *__restrict__ miss_hess,
+    int64_t N_node,
+    int64_t N_stride,
+    int64_t F,
+    int64_t B,
+    int64_t num_eras,
+    int rows_per_thread,
+    int64_t sh_max_elems)
+{
+    const int hist_feat_idx = blockIdx.x;
+    const int feat = feature_indices[hist_feat_idx];
+    const uint8_t *feat_bins = bin_data + static_cast<int64_t>(feat) * N_stride;
+    const int64_t block_base = static_cast<int64_t>(blockIdx.y) * blockDim.x * rows_per_thread;
+    const int64_t block_end = min(N_node, block_base + static_cast<int64_t>(blockDim.x) * rows_per_thread);
+    const int B_store = HAS_MISSING ? static_cast<int>(B + 1) : static_cast<int>(B);
+
+    __shared__ int32_t sh_meta[4]; // [0]=era_lo, [1]=era_hi, [2]=priv_mode (-1=global, 0=1x, 1=8x, 2=lockfree), [3]=e_local
+    if (threadIdx.x == 0)
+    {
+        int32_t elo = era_indices[sample_indices[block_base]];
+        int32_t ehi = era_indices[sample_indices[block_end - 1]];
+        int64_t e_loc = static_cast<int64_t>(ehi) - elo + 1;
+        int mode = -1;
+        if (elo >= 0 && ehi >= elo && ehi < num_eras)
+        {
+            if (e_loc * B_store * blockDim.x <= sh_max_elems)
+                mode = 2;
+            else if (e_loc * B_store * 8 <= sh_max_elems)
+                mode = 1;
+            else if (e_loc * B_store <= sh_max_elems)
+                mode = 0;
+        }
+        sh_meta[0] = elo;
+        sh_meta[1] = ehi;
+        sh_meta[2] = mode;
+        sh_meta[3] = static_cast<int32_t>(e_loc);
+    }
+    __syncthreads();
+
+    const int32_t era_lo = sh_meta[0];
+    const int32_t era_hi = sh_meta[1];
+    const int mode = sh_meta[2];
+    const int64_t e_local = sh_meta[3];
+    const int64_t hist_elems = e_local * B_store;
+
+    extern __shared__ float shmem[];
+    float *sh_grad = shmem;
+    float *sh_hess = &sh_grad[sh_max_elems];
+
+    if (mode >= 0)
+    {
+        const int64_t sh_stride = (mode == 2) ? blockDim.x : ((mode == 1) ? 8 : 1);
+        const int64_t sh_count = hist_elems * sh_stride;
+        for (int64_t i = threadIdx.x; i < sh_count; i += blockDim.x)
+        {
+            sh_grad[i] = 0.0f;
+            sh_hess[i] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    for (int r = 0; r < rows_per_thread; ++r)
+    {
+        const int64_t row = block_base + threadIdx.x + static_cast<int64_t>(r) * blockDim.x;
+        if (row < N_node)
+        {
+            const int32_t sample = (sample_indices != nullptr)
+                ? sample_indices[row]
+                : static_cast<int32_t>(row);
+            int32_t bin;
+            if (PACK4)
+            {
+                const uint8_t bv = feat_bins[sample >> 1];
+                const int32_t nib = (sample & 1) ? (bv >> 4) : (bv & 0x0F);
+                bin = nib - 1;
+            }
+            else
+            {
+                bin = static_cast<int32_t>(reinterpret_cast<const int8_t *>(feat_bins)[sample]);
+            }
+
+            const int32_t b_slot = (bin >= 0 && bin < B) ? bin : (HAS_MISSING ? static_cast<int32_t>(B) : -1);
+            if (b_slot >= 0)
+            {
+                float g, h;
+                if (HAS_HESS)
+                {
+                    const float2 gh = gh_packed[sample];
+                    g = gh.x;
+                    h = gh.y;
+                }
+                else
+                {
+                    g = grads[sample];
+                    h = 1.0f;
+                }
+                const int32_t era = era_indices[sample];
+                if (mode >= 0 && era >= era_lo && era <= era_hi)
+                {
+                    const int64_t hist_idx = static_cast<int64_t>(era - era_lo) * B_store + b_slot;
+                    if (mode == 2)
+                    {
+                        const int64_t slot = hist_idx * blockDim.x + threadIdx.x;
+                        sh_grad[slot] += g;
+                        sh_hess[slot] += h;
+                    }
+                    else if (mode == 1)
+                    {
+                        const int64_t slot = hist_idx * 8 + (threadIdx.x & 7);
+                        atomicAdd(&sh_grad[slot], g);
+                        atomicAdd(&sh_hess[slot], h);
+                    }
+                    else
+                    {
+                        atomicAdd(&sh_grad[hist_idx], g);
+                        atomicAdd(&sh_hess[hist_idx], h);
+                    }
+                }
+                else
+                {
+                    if (HAS_MISSING && b_slot == B)
+                    {
+                        const int64_t m_idx = static_cast<int64_t>(era) * F + hist_feat_idx;
+                        atomicAdd(&miss_grad[m_idx], g);
+                        atomicAdd(&miss_hess[m_idx], h);
+                    }
+                    else
+                    {
+                        const int64_t g_idx = static_cast<int64_t>(era) * F * B + static_cast<int64_t>(hist_feat_idx) * B + b_slot;
+                        atomicAdd(&grad_hist[g_idx], g);
+                        atomicAdd(&hess_hist[g_idx], h);
+                    }
+                }
+            }
+        }
+    }
+
+    if (mode < 0) return;
+    __syncthreads();
+
+    if (mode == 2)
+    {
+        const int warp_id = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int num_warps = blockDim.x >> 5;
+        for (int64_t b = warp_id; b < hist_elems; b += num_warps)
+        {
+            float sum_g = 0.0f, sum_h = 0.0f;
+            const int64_t base_b = b * blockDim.x;
+            for (int t = lane; t < blockDim.x; t += 32)
+            {
+                sum_g += sh_grad[base_b + t];
+                sum_h += sh_hess[base_b + t];
+            }
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                sum_g += __shfl_down_sync(0xFFFFFFFF, sum_g, offset);
+                sum_h += __shfl_down_sync(0xFFFFFFFF, sum_h, offset);
+            }
+            if (lane == 0 && (sum_h != 0.0f || sum_g != 0.0f))
+            {
+                const int64_t e = era_lo + (b / B_store);
+                const int64_t bin_s = b % B_store;
+                if (HAS_MISSING && bin_s == B)
+                {
+                    const int64_t m_idx = e * F + hist_feat_idx;
+                    atomicAdd(&miss_grad[m_idx], sum_g);
+                    atomicAdd(&miss_hess[m_idx], sum_h);
+                }
+                else
+                {
+                    const int64_t g_idx = e * F * B + static_cast<int64_t>(hist_feat_idx) * B + bin_s;
+                    atomicAdd(&grad_hist[g_idx], sum_g);
+                    atomicAdd(&hess_hist[g_idx], sum_h);
+                }
+            }
+        }
+    }
+    else if (mode == 1)
+    {
+        for (int64_t b = threadIdx.x; b < hist_elems; b += blockDim.x)
+        {
+            const int64_t base_b = b * 8;
+            float g_val = 0.0f, h_val = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k)
+            {
+                g_val += sh_grad[base_b + k];
+                h_val += sh_hess[base_b + k];
+            }
+            if (h_val != 0.0f || g_val != 0.0f)
+            {
+                const int64_t e = era_lo + (b / B_store);
+                const int64_t bin_s = b % B_store;
+                if (HAS_MISSING && bin_s == B)
+                {
+                    const int64_t m_idx = e * F + hist_feat_idx;
+                    atomicAdd(&miss_grad[m_idx], g_val);
+                    atomicAdd(&miss_hess[m_idx], h_val);
+                }
+                else
+                {
+                    const int64_t g_idx = e * F * B + static_cast<int64_t>(hist_feat_idx) * B + bin_s;
+                    atomicAdd(&grad_hist[g_idx], g_val);
+                    atomicAdd(&hess_hist[g_idx], h_val);
+                }
+            }
+        }
+    }
+    else
+    {
+        for (int64_t b = threadIdx.x; b < hist_elems; b += blockDim.x)
+        {
+            const float g_val = sh_grad[b];
+            const float h_val = sh_hess[b];
+            if (h_val != 0.0f || g_val != 0.0f)
+            {
+                const int64_t e = era_lo + (b / B_store);
                 const int64_t bin_s = b % B_store;
                 if (HAS_MISSING && bin_s == B)
                 {
@@ -571,7 +857,9 @@ __global__ void histogram_fm_v2_global_kernel(
         const int64_t row = block_base + threadIdx.x + static_cast<int64_t>(r) * blockDim.x;
         if (row < N_node)
         {
-            const int32_t sample = sample_indices[row];
+            const int32_t sample = (sample_indices != nullptr)
+                ? sample_indices[row]
+                : static_cast<int32_t>(row);
             int32_t bin;
             if (PACK4)
             {
@@ -638,44 +926,51 @@ static void dispatch_histogram_fm_v2(
     dim3 threads,
     int rows_per_thread,
     size_t lock_free_bytes,
+    size_t way8_bytes,
     size_t shared_bytes,
     const cudaDeviceProp *properties,
     cudaStream_t stream)
 {
-    if (lock_free_bytes <= static_cast<size_t>(properties->sharedMemPerBlock))
+    const size_t static_limit = static_cast<size_t>(properties->sharedMemPerBlock);
+    const size_t shared_limit = std::max(properties->sharedMemPerBlock, properties->sharedMemPerBlockOptin);
+    if (lock_free_bytes <= static_limit)
     {
-        histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, true>
+        histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, 2>
             <<<blocks, threads, lock_free_bytes, stream>>>(
+                bin_ptr, grads_ptr, gh_ptr, samples_ptr, feats_ptr, eras_ptr,
+                grad_hist_ptr, hess_hist_ptr, miss_grad_ptr, miss_hess_ptr,
+                N_node, N_stride, F, B, num_eras, rows_per_thread);
+    }
+    else if (way8_bytes <= static_limit)
+    {
+        histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, 1>
+            <<<blocks, threads, way8_bytes, stream>>>(
+                bin_ptr, grads_ptr, gh_ptr, samples_ptr, feats_ptr, eras_ptr,
+                grad_hist_ptr, hess_hist_ptr, miss_grad_ptr, miss_hess_ptr,
+                N_node, N_stride, F, B, num_eras, rows_per_thread);
+    }
+    else if (shared_bytes <= shared_limit)
+    {
+        if (shared_bytes > static_limit)
+        {
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, 0>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared_limit)));
+        }
+        histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, 0>
+            <<<blocks, threads, shared_bytes, stream>>>(
                 bin_ptr, grads_ptr, gh_ptr, samples_ptr, feats_ptr, eras_ptr,
                 grad_hist_ptr, hess_hist_ptr, miss_grad_ptr, miss_hess_ptr,
                 N_node, N_stride, F, B, num_eras, rows_per_thread);
     }
     else
     {
-        const size_t shared_limit = std::max(properties->sharedMemPerBlock, properties->sharedMemPerBlockOptin);
-        if (shared_bytes <= shared_limit)
-        {
-            if (shared_bytes > static_cast<size_t>(properties->sharedMemPerBlock))
-            {
-                C10_CUDA_CHECK(cudaFuncSetAttribute(
-                    histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, false>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    static_cast<int>(shared_limit)));
-            }
-            histogram_fm_v2_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING, false>
-                <<<blocks, threads, shared_bytes, stream>>>(
-                    bin_ptr, grads_ptr, gh_ptr, samples_ptr, feats_ptr, eras_ptr,
-                    grad_hist_ptr, hess_hist_ptr, miss_grad_ptr, miss_hess_ptr,
-                    N_node, N_stride, F, B, num_eras, rows_per_thread);
-        }
-        else
-        {
-            histogram_fm_v2_global_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING>
-                <<<blocks, threads, 0, stream>>>(
-                    bin_ptr, grads_ptr, gh_ptr, samples_ptr, feats_ptr, eras_ptr,
-                    grad_hist_ptr, hess_hist_ptr, miss_grad_ptr, miss_hess_ptr,
-                    N_node, N_stride, F, B, rows_per_thread);
-        }
+        histogram_fm_v2_global_kernel<SINGLE_ERA, HAS_HESS, PACK4, HAS_MISSING>
+            <<<blocks, threads, 0, stream>>>(
+                bin_ptr, grads_ptr, gh_ptr, samples_ptr, feats_ptr, eras_ptr,
+                grad_hist_ptr, hess_hist_ptr, miss_grad_ptr, miss_hess_ptr,
+                N_node, N_stride, F, B, rows_per_thread);
     }
 }
 
@@ -694,11 +989,16 @@ void launch_histogram_fm_v2(
     bool pack4,
     bool has_missing,
     int threads_per_block = 128,
-    int rows_per_thread = 16)
+    int rows_per_thread = 16,
+    bool contiguous_samples = false,
+    bool era_sorted = false)
 {
     const auto device = bin_data.device();
     check_cuda_tensor(bin_data, pack4 ? at::kByte : at::kChar, device, "bin_data");
-    check_cuda_tensor(sample_indices, at::kInt, device, "sample_indices");
+    if (!contiguous_samples)
+    {
+        check_cuda_tensor(sample_indices, at::kInt, device, "sample_indices");
+    }
     check_cuda_tensor(feature_indices, at::kInt, device, "feature_indices");
     check_cuda_tensor(era_indices, at::kInt, device, "era_indices");
     check_cuda_tensor(grad_hist, at::kFloat, device, "grad_hist");
@@ -719,7 +1019,7 @@ void launch_histogram_fm_v2(
                     "grads must be 1D matching era_indices");
     }
 
-    const int64_t N_node = sample_indices.size(0);
+    const int64_t N_node = contiguous_samples ? era_indices.size(0) : sample_indices.size(0);
     const int64_t F = feature_indices.size(0);
     if (N_node == 0 || F == 0) return;
 
@@ -755,6 +1055,7 @@ void launch_histogram_fm_v2(
     const int64_t B_store = has_missing ? (num_bins + 1) : num_bins;
     const int64_t hist_elems = num_eras * B_store;
     const size_t lock_free_bytes = static_cast<size_t>(2) * hist_elems * eff_threads * sizeof(float);
+    const size_t way8_bytes = static_cast<size_t>(2) * hist_elems * 8 * sizeof(float);
     const size_t shared_bytes = static_cast<size_t>(2) * hist_elems * sizeof(float);
 
     const uint8_t *bin_ptr = pack4
@@ -762,7 +1063,7 @@ void launch_histogram_fm_v2(
         : reinterpret_cast<const uint8_t *>(bin_data.data_ptr<int8_t>());
     const float *g_ptr = has_hess ? nullptr : grads.data_ptr<float>();
     const float2 *gh_ptr = has_hess ? reinterpret_cast<const float2 *>(gh_packed.data_ptr<float>()) : nullptr;
-    const int32_t *s_ptr = sample_indices.data_ptr<int32_t>();
+    const int32_t *s_ptr = contiguous_samples ? nullptr : sample_indices.data_ptr<int32_t>();
     const int32_t *f_ptr = feature_indices.data_ptr<int32_t>();
     const int32_t *e_ptr = era_indices.data_ptr<int32_t>();
     float *hist_g_ptr = grad_hist.data_ptr<float>();
@@ -770,25 +1071,47 @@ void launch_histogram_fm_v2(
     float *mg_ptr = has_missing ? miss_grad.data_ptr<float>() : nullptr;
     float *mh_ptr = has_missing ? miss_hess.data_ptr<float>() : nullptr;
 
+    // Fast path for era-sorted multi-era inputs when full histogram shmem exceeds 12 KB
+    if (num_eras > 1 && era_sorted && s_ptr != nullptr && shared_bytes > 12288)
+    {
+        const size_t budget_bytes = std::min<size_t>(static_cast<size_t>(properties->sharedMemPerBlock), 8192);
+        const int64_t sh_max_elems = static_cast<int64_t>((budget_bytes - 128) / (2 * sizeof(float)));
+        const size_t dyn_bytes = static_cast<size_t>(sh_max_elems) * 2 * sizeof(float);
+        const int e_flags = (has_hess ? 4 : 0) | (pack4 ? 2 : 0) | (has_missing ? 1 : 0);
+        switch (e_flags)
+        {
+            case 0: histogram_fm_v2_era_sorted_kernel<false, false, false><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 1: histogram_fm_v2_era_sorted_kernel<false, false, true ><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 2: histogram_fm_v2_era_sorted_kernel<false, true,  false><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 3: histogram_fm_v2_era_sorted_kernel<false, true,  true ><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 4: histogram_fm_v2_era_sorted_kernel<true,  false, false><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 5: histogram_fm_v2_era_sorted_kernel<true,  false, true ><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 6: histogram_fm_v2_era_sorted_kernel<true,  true,  false><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+            case 7: histogram_fm_v2_era_sorted_kernel<true,  true,  true ><<<blocks, threads, dyn_bytes, stream.stream()>>>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, eff_rpt, sh_max_elems); break;
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
+
     const int flags = (num_eras == 1 ? 8 : 0) | (has_hess ? 4 : 0) | (pack4 ? 2 : 0) | (has_missing ? 1 : 0);
     switch (flags)
     {
-        case 0:  dispatch_histogram_fm_v2<false, false, false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 1:  dispatch_histogram_fm_v2<false, false, false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 2:  dispatch_histogram_fm_v2<false, false, true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 3:  dispatch_histogram_fm_v2<false, false, true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 4:  dispatch_histogram_fm_v2<false, true,  false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 5:  dispatch_histogram_fm_v2<false, true,  false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 6:  dispatch_histogram_fm_v2<false, true,  true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 7:  dispatch_histogram_fm_v2<false, true,  true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 8:  dispatch_histogram_fm_v2<true,  false, false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 9:  dispatch_histogram_fm_v2<true,  false, false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 10: dispatch_histogram_fm_v2<true,  false, true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 11: dispatch_histogram_fm_v2<true,  false, true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 12: dispatch_histogram_fm_v2<true,  true,  false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 13: dispatch_histogram_fm_v2<true,  true,  false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 14: dispatch_histogram_fm_v2<true,  true,  true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
-        case 15: dispatch_histogram_fm_v2<true,  true,  true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, shared_bytes, properties, stream.stream()); break;
+        case 0:  dispatch_histogram_fm_v2<false, false, false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 1:  dispatch_histogram_fm_v2<false, false, false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 2:  dispatch_histogram_fm_v2<false, false, true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 3:  dispatch_histogram_fm_v2<false, false, true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 4:  dispatch_histogram_fm_v2<false, true,  false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 5:  dispatch_histogram_fm_v2<false, true,  false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 6:  dispatch_histogram_fm_v2<false, true,  true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 7:  dispatch_histogram_fm_v2<false, true,  true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 8:  dispatch_histogram_fm_v2<true,  false, false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 9:  dispatch_histogram_fm_v2<true,  false, false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 10: dispatch_histogram_fm_v2<true,  false, true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 11: dispatch_histogram_fm_v2<true,  false, true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 12: dispatch_histogram_fm_v2<true,  true,  false, false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 13: dispatch_histogram_fm_v2<true,  true,  false, true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 14: dispatch_histogram_fm_v2<true,  true,  true,  false>(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
+        case 15: dispatch_histogram_fm_v2<true,  true,  true,  true >(bin_ptr, g_ptr, gh_ptr, s_ptr, f_ptr, e_ptr, hist_g_ptr, hist_h_ptr, mg_ptr, mh_ptr, N_node, N_stride, F, num_bins, num_eras, blocks, threads, eff_rpt, lock_free_bytes, way8_bytes, shared_bytes, properties, stream.stream()); break;
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -857,4 +1180,312 @@ void launch_extract_split_mask(
             feat_ptr, sample_indices.data_ptr<int32_t>(), N_node, split_bin, default_left, out_mask.data_ptr<bool>());
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <bool PACK4>
+__global__ void partition_count_kernel(
+    const uint8_t *__restrict__ feat_bins,
+    const int32_t *__restrict__ in_samples,
+    int64_t N_node,
+    int32_t split_bin,
+    bool default_left,
+    int32_t *__restrict__ block_counts)
+{
+    const int64_t b = static_cast<int64_t>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int64_t row0 = b * 1024 + static_cast<int64_t>(tid) * 4;
+
+    int local_cnt = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int64_t row = row0 + k;
+        if (row < N_node)
+        {
+            const int32_t sample = in_samples[row];
+            int32_t bin;
+            if (PACK4)
+            {
+                const uint8_t bv = feat_bins[sample >> 1];
+                const int32_t nib = (sample & 1) ? (bv >> 4) : (bv & 0x0F);
+                bin = nib - 1;
+            }
+            else
+            {
+                bin = static_cast<int32_t>(reinterpret_cast<const int8_t *>(feat_bins)[sample]);
+            }
+            if ((bin < 0) ? default_left : (bin <= split_bin))
+            {
+                ++local_cnt;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local_cnt += __shfl_down_sync(0xFFFFFFFF, local_cnt, offset);
+    }
+
+    __shared__ int32_t sh_warps[8];
+    if (lane == 0)
+    {
+        sh_warps[warp] = local_cnt;
+    }
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        int32_t wsum = (lane < 8) ? sh_warps[lane] : 0;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1)
+        {
+            wsum += __shfl_down_sync(0xFFFFFFFF, wsum, offset);
+        }
+        if (lane == 0)
+        {
+            block_counts[b] = wsum;
+        }
+    }
+}
+
+__global__ void prefix_scan_blocks_kernel(
+    int32_t *__restrict__ block_counts,
+    int64_t num_blocks)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ int32_t sh_warps[8];
+    __shared__ int32_t sh_running;
+
+    if (tid == 0) sh_running = 0;
+    __syncthreads();
+
+    for (int64_t b0 = 0; b0 < num_blocks; b0 += 256)
+    {
+        const int64_t idx = b0 + tid;
+        const int32_t c = (idx < num_blocks) ? block_counts[idx] : 0;
+        int32_t val = c;
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1)
+        {
+            int32_t n = __shfl_up_sync(0xFFFFFFFF, val, d);
+            if (lane >= d) val += n;
+        }
+        if (lane == 31) sh_warps[warp] = val;
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            int32_t wv = (lane < 8) ? sh_warps[lane] : 0;
+            int32_t wo = wv;
+            #pragma unroll
+            for (int d = 1; d < 8; d <<= 1)
+            {
+                int32_t n = __shfl_up_sync(0xFFFFFFFF, wv, d);
+                if (lane >= d) wv += n;
+            }
+            if (lane < 8) sh_warps[lane] = wv - wo;
+        }
+        __syncthreads();
+
+        const int32_t excl = (val - c) + sh_warps[warp];
+        const int32_t run = sh_running;
+        if (idx < num_blocks)
+        {
+            block_counts[idx] = run + excl;
+        }
+        __syncthreads();
+        if (tid == 255)
+        {
+            sh_running = run + excl + c;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        block_counts[num_blocks] = sh_running;
+    }
+}
+
+template <bool PACK4>
+__global__ void partition_scatter_kernel(
+    const uint8_t *__restrict__ feat_bins,
+    const int32_t *__restrict__ in_samples,
+    const int32_t *__restrict__ block_offsets,
+    int64_t N_node,
+    int64_t num_blocks,
+    int32_t split_bin,
+    bool default_left,
+    int32_t *__restrict__ out_samples)
+{
+    const int64_t b = static_cast<int64_t>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int64_t row0 = b * 1024 + static_cast<int64_t>(tid) * 4;
+
+    __shared__ int32_t sh_warps[8];
+    __shared__ int32_t sh_meta[2];
+    if (tid == 0)
+    {
+        sh_meta[0] = block_offsets[b];
+        sh_meta[1] = block_offsets[num_blocks];
+    }
+
+    int32_t s[4];
+    uint8_t is_l[4] = {0, 0, 0, 0};
+    int32_t local_cnt = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int64_t row = row0 + k;
+        if (row < N_node)
+        {
+            const int32_t sample = in_samples[row];
+            s[k] = sample;
+            int32_t bin;
+            if (PACK4)
+            {
+                const uint8_t bv = feat_bins[sample >> 1];
+                const int32_t nib = (sample & 1) ? (bv >> 4) : (bv & 0x0F);
+                bin = nib - 1;
+            }
+            else
+            {
+                bin = static_cast<int32_t>(reinterpret_cast<const int8_t *>(feat_bins)[sample]);
+            }
+            if ((bin < 0) ? default_left : (bin <= split_bin))
+            {
+                is_l[k] = 1;
+                ++local_cnt;
+            }
+        }
+    }
+
+    int32_t val = local_cnt;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1)
+    {
+        int32_t n = __shfl_up_sync(0xFFFFFFFF, val, d);
+        if (lane >= d) val += n;
+    }
+    if (lane == 31) sh_warps[warp] = val;
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        int32_t wv = (lane < 8) ? sh_warps[lane] : 0;
+        int32_t wo = wv;
+        #pragma unroll
+        for (int d = 1; d < 8; d <<= 1)
+        {
+            int32_t n = __shfl_up_sync(0xFFFFFFFF, wv, d);
+            if (lane >= d) wv += n;
+        }
+        if (lane < 8) sh_warps[lane] = wv - wo;
+    }
+    __syncthreads();
+
+    const int64_t left_base = static_cast<int64_t>(sh_meta[0]);
+    const int64_t right_base = static_cast<int64_t>(sh_meta[1]) + (b * 1024 - left_base);
+    int64_t cur_l = static_cast<int64_t>((val - local_cnt) + sh_warps[warp]);
+
+    #pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int64_t row = row0 + k;
+        if (row < N_node)
+        {
+            if (is_l[k])
+            {
+                out_samples[left_base + cur_l] = s[k];
+                ++cur_l;
+            }
+            else
+            {
+                const int64_t local_i = static_cast<int64_t>(tid) * 4 + k;
+                const int64_t cur_r = local_i - cur_l;
+                out_samples[right_base + cur_r] = s[k];
+            }
+        }
+    }
+}
+
+int64_t launch_partition_samples_fm(
+    const at::Tensor &bin_data,
+    const at::Tensor &in_samples,
+    at::Tensor &out_samples,
+    at::Tensor &block_counts,
+    int64_t feat_idx,
+    int32_t split_bin,
+    bool default_left,
+    bool pack4)
+{
+    const auto device = bin_data.device();
+    check_cuda_tensor(bin_data, pack4 ? at::kByte : at::kChar, device, "bin_data");
+    check_cuda_tensor(in_samples, at::kInt, device, "in_samples");
+    check_cuda_tensor(out_samples, at::kInt, device, "out_samples");
+    check_cuda_tensor(block_counts, at::kInt, device, "block_counts");
+    TORCH_CHECK(bin_data.dim() == 2 && in_samples.dim() == 1 && out_samples.dim() == 1 && block_counts.dim() == 1,
+                "partition_samples_fm inputs have incorrect dimensions");
+    TORCH_CHECK(feat_idx >= 0 && feat_idx < bin_data.size(0), "feat_idx out of bounds");
+    const int64_t N_node = in_samples.size(0);
+    TORCH_CHECK(N_node <= std::numeric_limits<int32_t>::max(), "N_node exceeds int32 capacity");
+    TORCH_CHECK(out_samples.size(0) >= N_node, "out_samples too small for in_samples");
+    if (N_node == 0) return 0;
+
+    const int64_t num_blocks = (N_node + 1023) / 1024;
+    TORCH_CHECK(block_counts.size(0) >= num_blocks + 1, "block_counts workspace too small");
+
+    const int64_t N_stride = bin_data.size(1);
+    const c10::cuda::CUDAGuard guard(device);
+    const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+    const auto *properties = at::cuda::getDeviceProperties(device.index());
+    TORCH_CHECK(num_blocks <= properties->maxGridSize[0], "partition_samples_fm launch exceeds grid limits");
+
+    const uint8_t *feat_ptr = (pack4
+        ? bin_data.data_ptr<uint8_t>()
+        : reinterpret_cast<const uint8_t *>(bin_data.data_ptr<int8_t>())) + feat_idx * N_stride;
+    const int32_t *in_ptr = in_samples.data_ptr<int32_t>();
+    int32_t *out_ptr = out_samples.data_ptr<int32_t>();
+    int32_t *cnt_ptr = block_counts.data_ptr<int32_t>();
+
+    if (pack4)
+    {
+        partition_count_kernel<true><<<num_blocks, 256, 0, stream.stream()>>>(
+            feat_ptr, in_ptr, N_node, split_bin, default_left, cnt_ptr);
+    }
+    else
+    {
+        partition_count_kernel<false><<<num_blocks, 256, 0, stream.stream()>>>(
+            feat_ptr, in_ptr, N_node, split_bin, default_left, cnt_ptr);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    prefix_scan_blocks_kernel<<<1, 256, 0, stream.stream()>>>(cnt_ptr, num_blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    if (pack4)
+    {
+        partition_scatter_kernel<true><<<num_blocks, 256, 0, stream.stream()>>>(
+            feat_ptr, in_ptr, cnt_ptr, N_node, num_blocks, split_bin, default_left, out_ptr);
+    }
+    else
+    {
+        partition_scatter_kernel<false><<<num_blocks, 256, 0, stream.stream()>>>(
+            feat_ptr, in_ptr, cnt_ptr, N_node, num_blocks, split_bin, default_left, out_ptr);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int32_t host_total_left = 0;
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        &host_total_left, cnt_ptr + num_blocks, sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream.stream()));
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    return static_cast<int64_t>(host_total_left);
 }
