@@ -1,6 +1,7 @@
 import os
+from pathlib import Path
+import sys
 from setuptools import setup, find_packages
-from setuptools.command.build_ext import build_ext as build_ext_orig
 
 # Try importing torch and checking CUDA support
 try:
@@ -25,18 +26,25 @@ def get_extensions():
                     "warpgbm/cuda/binner.cu",
                     "warpgbm/cuda/predict.cu",
                     "warpgbm/cuda/node_kernel.cpp",
-                ]
+                ],
+                depends=["warpgbm/cuda/cuda_utils.h"],
+                extra_compile_args={
+                    "cxx": ["/Zc:preprocessor"] if os.name == "nt" else [],
+                    "nvcc": ["-Xcompiler", "/Zc:preprocessor"] if os.name == "nt" else [],
+                }
             )
         )
-    else:
-        if torch_available:
-            print("PyTorch installed but CUDA not available. Skipping CUDA extensions.")
-        else:
-            print("PyTorch not found. Skipping CUDA extensions.")
+    elif any(arg.startswith("bdist") or arg in {"build", "build_ext", "editable_wheel", "install", "develop"}
+             for arg in sys.argv[1:]):
+        raise RuntimeError(
+            "WarpGBM requires CUDA-enabled PyTorch and a CUDA toolkit to build. "
+            "Install matching CUDA PyTorch, set CUDA_HOME, and build with --no-build-isolation. "
+            "A CPU-only wheel is not supported."
+        )
     return extensions
 
 # Read version
-with open("version.txt") as f:
+with Path(__file__).with_name("version.txt").open() as f:
     version = f.read().strip()
 
 setup(
