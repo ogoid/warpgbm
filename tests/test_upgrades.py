@@ -312,3 +312,121 @@ def test_validation_and_cuda_contracts():
             g_h, h_h, mg, mg, torch.empty(0, dtype=torch.bool, device="cuda"),
             0.0, 1.0, 0.0, 1.0, 0.0, 0.0, False, out_best
         )
+
+
+def test_gpu_partition_stability_and_parity():
+    rng = np.random.default_rng(101)
+    N = 2503  # spans >2 1024-sample partition blocks + odd tail
+    F = 4
+    X_int = rng.integers(-1, 8, size=(N, F), dtype=np.int8)
+    perm = torch.tensor(rng.permutation(N), dtype=torch.int32, device="cuda")
+
+    bin_rm = torch.as_tensor(X_int, device="cuda")
+    bin_fm = bin_rm.t().contiguous()
+    bin_p4 = torch.empty((F, (N + 1) // 2), dtype=torch.uint8, device="cuda")
+    flags = torch.zeros(2, dtype=torch.int32, device="cuda")
+    node_kernel.pack_int8_to_4bit_fm(bin_rm, bin_p4, flags, 0, 8)
+
+    for default_left in (True, False):
+        mask = torch.empty(N, dtype=torch.bool, device="cuda")
+        node_kernel.extract_split_mask(bin_fm, perm, 2, 3, default_left, False, mask)
+        ref_left = perm[mask]
+        ref_right = perm[~mask]
+
+        for pack4, data in ((False, bin_fm), (True, bin_p4)):
+            out = torch.empty_like(perm)
+            ws = torch.empty((N + 1023) // 1024 + 2, dtype=torch.int32, device="cuda")
+            n_left = node_kernel.partition_samples_fm(data, perm, out, ws, 2, 3, default_left, pack4)
+            assert n_left == ref_left.numel()
+            torch.testing.assert_close(out[:n_left], ref_left)
+            torch.testing.assert_close(out[n_left:], ref_right)
+
+
+def test_multiblock_pooled_and_era_select_parity():
+    torch.manual_seed(7)
+    F, B = 700, 8  # F > 512 triggers multi-block pooled split
+    G = torch.randn((1, F, B), dtype=torch.float32, device="cuda") * 2.0
+    H = torch.rand((1, F, B), dtype=torch.float32, device="cuda") * 5.0 + 1.0
+    mg = torch.randn((1, F), dtype=torch.float32, device="cuda")
+    mh = torch.rand((1, F), dtype=torch.float32, device="cuda") * 2.0
+    lmask = torch.rand(F, device="cuda") > 0.3
+    out_mb = torch.empty(10, dtype=torch.float32, device="cuda")
+    node_kernel.find_best_split_pooled(
+        G, H, mg, mh, lmask, 0.0, 1.0, 0.5, 1.0, 2.0, 0.2, True, out_mb
+    )
+    b = out_mb.tolist()
+    win_f = int(b[0])
+    assert 0 <= win_f < F
+    assert lmask[win_f].item() is True
+    assert b[3] > 0.0
+
+    # Verify find_best_split_era_select matches find_best_split_fused across era_mode
+    E, Fe, Be = 12, 48, 6
+    Ge = torch.randn((E, Fe, Be), dtype=torch.float32, device="cuda")
+    He = torch.rand((E, Fe, Be), dtype=torch.float32, device="cuda") * 4.0 + 2.0
+    tG = Ge.sum(dim=2)[:, 0].contiguous() + 0.5
+    tH = He.sum(dim=2)[:, 0].contiguous() + 1.0
+    lmask_e = torch.rand(Fe, device="cuda") > 0.25
+    M = 2 * (Be - 1)
+    cg = torch.empty((E, Fe, M), dtype=torch.float32, device="cuda")
+    cd = torch.empty((E, Fe, M), dtype=torch.float32, device="cuda")
+    os_t = torch.empty((Fe, M), dtype=torch.float32, device="cuda")
+    oa_t = torch.empty((Fe, M), dtype=torch.float32, device="cuda")
+    om_t = torch.empty((Fe, M), dtype=torch.float32, device="cuda")
+    ob_e = torch.empty(5, dtype=torch.float32, device="cuda")
+    og_e = torch.empty(E, dtype=torch.float32, device="cuda")
+    empty_f = torch.empty(0, dtype=torch.float32, device="cuda")
+
+    for mode in (0, 2):
+        node_kernel.find_best_split_fused(
+            Ge, He, tG, tH, empty_f, 0.0, 1.0, 0.0, 1.0, True, mode, 0.5, 2.0,
+            cg, cd, os_t, oa_t, om_t, 128
+        )
+        scores = os_t.clone()
+        scores[~lmask_e, :] = float("-inf")
+        if mode == 0:
+            agr = oa_t.clone()
+            agr[~lmask_e, :] = -1.0
+            valid = (agr == agr.max()) & (scores > float("-inf"))
+            ref_idx = int(torch.argmax(torch.where(valid, scores, float("-inf"))).item())
+        else:
+            ref_idx = int(torch.argmax(scores).item())
+
+        node_kernel.find_best_split_era_select(
+            Ge, He, tG, tH, empty_f, lmask_e, 0.0, 1.0, 0.0, 1.0, True, mode, 0.5, 2.0,
+            cg, cd, os_t, oa_t, om_t, ob_e, og_e, 128
+        )
+        res = ob_e.tolist()
+        assert int(res[0]) * M + int(res[3]) == ref_idx
+        torch.testing.assert_close(og_e, cg[:, int(res[0]), int(res[3])])
+
+
+def test_era_sorted_large_era_and_int4_predict_parity():
+    rng = np.random.default_rng(88)
+    N, F, E = 2000, 16, 250  # 2 * 250 * 8 * 4 = 16000 > 12288 -> era_sorted path
+    X = rng.normal(size=(N, F)).astype(np.float32)
+    X[:100, 0] = np.nan
+    eras = np.repeat(np.arange(E, dtype=np.int32), N // E)
+    rng.shuffle(eras)
+    y = np.where(np.isnan(X[:, 0]), 3.0, 1.5 * X[:, 0] - 0.5 * X[:, 1]).astype(np.float32)
+
+    m_unp = WarpGBM(
+        n_estimators=6, max_depth=3, num_bins=7, era_split_mode="soft", pack_bits=False, random_state=88, verbose=0
+    ).fit(X, y, era_id=eras)
+    m_p4 = WarpGBM(
+        n_estimators=6, max_depth=3, num_bins=7, era_split_mode="soft", pack_bits=True, random_state=88, verbose=0
+    ).fit(X, y, era_id=eras)
+    assert getattr(m_p4, "_use_era_sorted", False) is True
+    np.testing.assert_allclose(m_p4.predict(X), m_unp.predict(X), rtol=1e-4, atol=1e-4)
+
+    # Verify packed int4 tree node predictions match legacy 7-float predict_binned
+    X_clean = rng.normal(size=(300, F)).astype(np.float32)
+    m_clean = WarpGBM(n_estimators=6, max_depth=3, num_bins=8, pack_bits=False, random_state=88, verbose=0).fit(
+        X_clean, (X_clean[:, 0] + X_clean[:, 1]).astype(np.float32)
+    )
+    b_rm = m_clean.bin_inference_data(X_clean)
+    b_fm = m_clean._bin_inference_data_fm(X_clean, pack4=False)
+    p_rm = m_clean.predict_binned(b_rm).cpu().numpy()
+    p_fm = m_clean._predict_binned_fm(b_fm, is_packed=False).cpu().numpy()
+    np.testing.assert_allclose(p_fm, p_rm, rtol=1e-5, atol=1e-5)
+
